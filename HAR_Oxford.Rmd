@@ -1,9 +1,4 @@
 ---
-title: "R Notebook"
-output: html_notebook
----
-
----
 title: "Rolling window HAR forecasts with Oxford man data."
 output: html_notebook
 ---

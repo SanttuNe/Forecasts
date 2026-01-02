@@ -1,0 +1,155 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+---
+title: "Rolling window HAR forecasts with Oxford man data."
+output: html_notebook
+---
+
+```{r}
+#load packages 
+library(tidyverse) #data manipulation
+library(lubridate) #date manipulation
+library(readr) #for reading files
+library(here) #for file paths
+library(zoo) 
+library(highfrequency) #for HAR model
+library(xts) #time indexed data frames
+library(rugarch) #for arfima and realized garch models
+options(scipen=999) #disable scientific notation
+
+```
+
+```{r echo=FALSE, message=FALSE}
+#define here
+here::here("HAR_Oxford")
+```
+
+## Data manipulation and cleaning
+```{r}
+
+#load data and rename columns
+big_oxford <- read_csv("oxfordmanrealizedvolatilityindices 2.csv") %>%
+  rename(date = ...1, RV_day = rv5) %>%
+  mutate(date = as.POSIXct(date, format = "%Y-%m-%d %H:%M:%S"))
+#inspect data and clean
+#spec(ox_raw)
+#head(ox_raw)
+
+
+
+```
+
+```{r}
+
+# select chosen indexes
+chosen_indexes <- c(".AEX", ".MXX", ".RUT", ".SSMI", ".BVSP", 
+                    ".FTSE", ".IXIC", ".HSI", ".GDAXI", ".FCHI")
+
+# Create a wide tibble. Date in first column, then one column per index
+chosen_wide_tibble <- big_oxford %>%
+  filter(Symbol %in% chosen_indexes) %>%
+  select(date, Symbol, RV_day) %>%
+  drop_na() %>%
+  pivot_wider(names_from = Symbol, values_from = RV_day) %>%
+  arrange(date)
+
+#convert to xts
+# The [,-1] removes the 'date' column so the matrix remains numeric
+chosen_wide_xts <- xts(chosen_wide_tibble[,-1], order.by = chosen_wide_tibble$date)
+
+#inspect the structure
+head(chosen_wide_xts)
+```
+
+## HAR forecasting setup
+```{r}
+#rolling window forecast function
+#I use HARmodel() from the highfrequency package which handles the daily, weekly and monthly RVs
+run_har_forecasts <- function(series_xts, window_size) {
+  
+  # Remove NAs (run for each index separately in the next chunk)
+  clean_series <- na.omit(series_xts)
+  
+  n <- nrow(clean_series) #specify number of rows
+  if (n <= window_size) return(NULL) 
+  
+  #initialize results matrix for faster computation
+  forecast_dates <- index(clean_series)[(window_size + 1):n]
+  results_mat <- matrix(NA, nrow = length(forecast_dates), ncol = 2)
+  colnames(results_mat) <- c("Actual", "Forecast")
+  
+  #rolling window loop
+  for (i in 1:(n - window_size)) {
+    # window to estimate the model on
+    train_data <- clean_series[i:(i + window_size - 1)]
+    
+    # Estimate HAR model with data in window (Standard 1, 5, 22 day components)
+    #RM for the realized measure per the package info
+    fit_har <- HARmodel(data = train_data, periods = c(1, 5, 22), h = 1, inputType = "RM")
+    
+    # Store actual value and forecast value
+    results_mat[i, ] <- c(as.numeric(clean_series[i + window_size]), 
+                          as.numeric(predict(fit_har)))
+  }
+  
+  return(xts(results_mat, order.by = forecast_dates))
+}
+```
+
+
+## Run functions
+
+```{r}
+# Initialize list to store xts results for each symbol
+all_har_results <- list()
+
+for (idx in colnames(chosen_wide_xts)) {
+  cat("Processing HAR for Index:", idx, "...\n")
+  
+  # Run the rolling forecast with a 250-day window
+  res <- run_har_forecasts(chosen_wide_xts[, idx], 250)
+  #store results
+  if (!is.null(res)) {
+    all_har_results[[idx]] <- res
+  }
+}
+
+```
+
+## Combine the results into a single table
+
+```{r}
+
+#empty list to store results
+aligned_list <- list()
+
+#loop through to rename columns by index
+for (idx_name in names(all_har_results)) {
+  #get the results for the specific index
+  res <- all_har_results[[idx_name]]
+  
+  #rename columns so they include the Symbol name (e.g .AEX_Actual, .AEX_Forecast)
+  colnames(res) <- paste0(idx_name, c("_Actual", "_Forecast"))
+  
+  # Store in the temporary list
+  aligned_list[[idx_name]] <- res
+}
+
+#Merge all indices into one master xts object
+# The 'do.call(merge, ...)' function joins all xts objects by their date index
+master_forecast_table <- do.call(merge, aligned_list)
+
+#convert to a data frame to export
+HAR_forecasts_vs_actual <- data.frame(Date = index(master_forecast_table), coredata(master_forecast_table))
+
+
+
+# make a csv file
+write_csv(HAR_forecasts_vs_actual, "HAR_forecasts_Oxford.csv")
+
+```
+
+
